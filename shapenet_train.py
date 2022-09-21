@@ -7,9 +7,10 @@ from torch.utils.data import DataLoader
 from datasets.shapenet import build_shapenet
 from models.nerf import build_nerf
 from models.rendering import get_rays_shapenet, sample_points, volume_render
+import wandb
 
 
-def inner_loop(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
+def inner_loop(args, model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size, inner_steps):
     """
     train the inner model for a specified number of iterations
     """
@@ -30,6 +31,7 @@ def inner_loop(model, optim, imgs, poses, hwf, bound, num_samples, raybatch_size
         rgbs, sigmas = model(xyz)
         colors = volume_render(rgbs, sigmas, t_vals, white_bkgd=True)
         loss = F.mse_loss(colors, pixelbatch)
+        wandb.log({"metrics/loss": loss})
         loss.backward()
         optim.step()
 
@@ -40,17 +42,19 @@ def train_meta(args, meta_model, meta_optim, data_loader, device):
     https://arxiv.org/abs/1803.02999
     """
     for imgs, poses, hwf, bound in data_loader:
-        imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
-        imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
+        imgs, poses, hwf, bound = imgs.to(device), poses.to(
+            device), hwf.to(device), bound.to(device)
+        imgs, poses, hwf, bound = imgs.squeeze(
+        ), poses.squeeze(), hwf.squeeze(), bound.squeeze()
 
         meta_optim.zero_grad()
 
         inner_model = copy.deepcopy(meta_model)
         inner_optim = torch.optim.SGD(inner_model.parameters(), args.inner_lr)
 
-        inner_loop(inner_model, inner_optim, imgs, poses,
-                    hwf, bound, args.num_samples,
-                    args.train_batchsize, args.inner_steps)
+        inner_loop(args, inner_model, inner_optim, imgs, poses,
+                   hwf, bound, args.num_samples,
+                   args.train_batchsize, args.inner_steps)
         
         with torch.no_grad():
             for meta_param, inner_param in zip(meta_model.parameters(), inner_model.parameters()):
@@ -84,6 +88,7 @@ def report_result(model, imgs, poses, hwf, bound, num_samples, raybatch_size):
             error = F.mse_loss(img, synth)
             psnr = -10*torch.log10(error)
             view_psnrs.append(psnr)
+            wandb.log({"metrics/psnr": torch.stack(view_psnrs).mean()})
     
     scene_psnr = torch.stack(view_psnrs).mean()
     return scene_psnr
@@ -98,31 +103,40 @@ def val_meta(args, model, val_loader, device):
     
     val_psnrs = []
     for imgs, poses, hwf, bound in val_loader:
-        imgs, poses, hwf, bound = imgs.to(device), poses.to(device), hwf.to(device), bound.to(device)
-        imgs, poses, hwf, bound = imgs.squeeze(), poses.squeeze(), hwf.squeeze(), bound.squeeze()
+        imgs, poses, hwf, bound = imgs.to(device), poses.to(
+            device), hwf.to(device), bound.to(device)
+        imgs, poses, hwf, bound = imgs.squeeze(
+        ), poses.squeeze(), hwf.squeeze(), bound.squeeze()
 
-        tto_imgs, test_imgs = torch.split(imgs, [args.tto_views, args.test_views], dim=0)
-        tto_poses, test_poses = torch.split(poses, [args.tto_views, args.test_views], dim=0)
+        tto_imgs, test_imgs = torch.split(
+            imgs, [args.tto_views, args.test_views], dim=0)
+        tto_poses, test_poses = torch.split(
+            poses, [args.tto_views, args.test_views], dim=0)
 
         val_model.load_state_dict(meta_trained_state)
         val_optim = torch.optim.SGD(val_model.parameters(), args.tto_lr)
 
-        inner_loop(val_model, val_optim, tto_imgs, tto_poses, hwf,
-                    bound, args.num_samples, args.tto_batchsize, args.tto_steps)
-        
-        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound, 
-                                    args.num_samples, args.test_batchsize)
+        inner_loop(args, val_model, val_optim, tto_imgs, tto_poses, hwf,
+                   bound, args.num_samples, args.tto_batchsize, args.tto_steps)
+
+        scene_psnr = report_result(val_model, test_imgs, test_poses, hwf, bound,
+                                   args.num_samples, args.test_batchsize)
         val_psnrs.append(scene_psnr)
+        wandb.log({"metrics/val_psnr": torch.stack(val_psnrs).mean()})
 
     val_psnr = torch.stack(val_psnrs).mean()
     return val_psnr
 
 
 def main():
-    parser = argparse.ArgumentParser(description='shapenet few-shot view synthesis')
+    parser = argparse.ArgumentParser(
+        description='shapenet few-shot view synthesis')
     parser.add_argument('--config', type=str, required=True,
                         help='config file for the shape class (cars, chairs or lamps)')
+    parser.add_argument('--model_type', type=str, default='SimpleNeRf')
+    
     args = parser.parse_args()
+    wandb.init(project="nerf-meta", config=args)
 
     with open(args.config) as config:
         info = json.load(config)
@@ -132,12 +146,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_set = build_shapenet(image_set="train", dataset_root=args.dataset_root,
-                                splits_path=args.splits_path, num_views=args.train_views)
+                               splits_path=args.splits_path, num_views=args.train_views)
     train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
 
     val_set = build_shapenet(image_set="val", dataset_root=args.dataset_root,
-                            splits_path=args.splits_path,
-                            num_views=args.tto_views+args.test_views)
+                             splits_path=args.splits_path,
+                             num_views=args.tto_views+args.test_views)
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
 
     meta_model = build_nerf(args)
@@ -149,12 +163,13 @@ def main():
         train_meta(args, meta_model, meta_optim, train_loader, device)
         val_psnr = val_meta(args, meta_model, val_loader, device)
         print(f"Epoch: {epoch}, val psnr: {val_psnr:0.3f}")
+        wandb.log({"metrics/epoch": epoch})
 
         torch.save({
             'epoch': epoch,
             'meta_model_state_dict': meta_model.state_dict(),
             'meta_optim_state_dict': meta_optim.state_dict(),
-            }, f'meta_epoch{epoch}.pth')
+        }, f'meta_epoch{epoch}.pth')
 
 
 if __name__ == '__main__':
